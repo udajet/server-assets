@@ -1,20 +1,15 @@
 name: Temporary build Japan historical railways
 
 on:
-  push:
-    branches: [main]
-    paths:
-      - .github/workflows/tmp-build-japan-historical-railways.yml
-  pull_request:
-    branches: [main]
-    paths:
-      - tools/historical_railway_build_request.txt
+  issue_comment:
+    types: [created]
 
 permissions:
   contents: write
 
 jobs:
   build:
+    if: github.event.issue.pull_request && github.event.comment.body == '/build-historical-railways'
     runs-on: ubuntu-latest
     timeout-minutes: 180
     steps:
