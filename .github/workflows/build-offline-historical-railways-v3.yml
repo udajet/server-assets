@@ -1,0 +1,122 @@
+name: Build offline Japan historical railways KMZ v3
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - tools/offline_historical_railway_build_trigger_v2.txt
+  schedule:
+    - cron: '9,19,29,39,49,59 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: offline-japan-historical-railways
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Publish running marker
+        run: |
+          mkdir -p generated/historical_railways_build
+          python - <<'PY'
+          import json, os, time
+          from pathlib import Path
+          Path('generated/historical_railways_build/running.json').write_text(
+              json.dumps({
+                  'state': 'running',
+                  'run_id': int(os.environ['GITHUB_RUN_ID']),
+                  'started_utc': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
+                  'builder': 'pbf-v3',
+              }, ensure_ascii=False, indent=2),
+              encoding='utf-8',
+          )
+          PY
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add generated/historical_railways_build/running.json
+          git commit -m 'Mark railway build running [skip ci]' || true
+          git push origin main || true
+
+      - name: Install processing tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y osmium-tool
+          python -m pip install --upgrade requests pyshp
+
+      - name: Download base builder
+        run: |
+          curl -fsSL 'https://raw.githubusercontent.com/udajet/server-assets/tmp-build-japan-historical-railways-v4/tools/build_japan_historical_railways.py' -o /tmp/base_builder.py
+
+      - name: Build embedded offline KMZ
+        id: build
+        run: |
+          set +e
+          BASE_BUILDER=/tmp/base_builder.py python tools/run_pbf_offline_builder.py > /tmp/build-v3.log 2>&1
+          code=$?
+          set -e
+          echo "$code" > /tmp/build-v3-exit
+          tail -n 250 /tmp/build-v3.log || true
+
+      - name: Prepare artifact
+        if: always()
+        run: |
+          mkdir -p /tmp/rail-v3-artifact
+          cp /tmp/build-v3.log /tmp/rail-v3-artifact/build.log 2>/dev/null || true
+          cp /tmp/build-v3-exit /tmp/rail-v3-artifact/build_exit_code.txt 2>/dev/null || true
+          cp out_historical_railways/Japan_Historical_Railways_Offline_MaxCoverage.kmz /tmp/rail-v3-artifact/ 2>/dev/null || true
+          cp out_historical_railways/coverage_report.json /tmp/rail-v3-artifact/ 2>/dev/null || true
+
+      - name: Upload artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: japan-historical-railways-offline-v3-${{ github.run_id }}
+          path: /tmp/rail-v3-artifact
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
+
+      - name: Publish final status
+        if: always()
+        run: |
+          mkdir -p generated/historical_railways_build
+          cp /tmp/build-v3.log generated/historical_railways_build/build.log 2>/dev/null || true
+          cp out_historical_railways/coverage_report.json generated/historical_railways_build/coverage_report.json 2>/dev/null || true
+          code=$(cat /tmp/build-v3-exit 2>/dev/null || echo 99)
+          file='out_historical_railways/Japan_Historical_Railways_Offline_MaxCoverage.kmz'
+          size=0
+          sha=''
+          if [ -f "$file" ]; then
+            size=$(stat -c%s "$file")
+            sha=$(sha256sum "$file" | awk '{print $1}')
+          fi
+          CODE="$code" SIZE="$size" SHA="$sha" python - <<'PY'
+          import json, os, time
+          from pathlib import Path
+          Path('generated/historical_railways_build/status.json').write_text(
+              json.dumps({
+                  'exit_code': int(os.environ['CODE']),
+                  'run_id': int(os.environ['GITHUB_RUN_ID']),
+                  'artifact_name': 'japan-historical-railways-offline-v3-' + os.environ['GITHUB_RUN_ID'],
+                  'kmz_bytes': int(os.environ['SIZE']),
+                  'sha256': os.environ['SHA'],
+                  'completed_utc': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
+                  'builder': 'pbf-v3',
+              }, ensure_ascii=False, indent=2),
+              encoding='utf-8',
+          )
+          PY
+          git pull --rebase origin main || true
+          git add generated/historical_railways_build
+          git commit -m 'Store offline railway build result [skip ci]' || true
+          git push origin main || true
