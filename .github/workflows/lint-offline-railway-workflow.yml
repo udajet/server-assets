@@ -1,0 +1,33 @@
+name: Lint offline railway workflow
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - tools/offline_historical_railway_build_trigger_v2.txt
+
+permissions:
+  contents: write
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+      - name: Run actionlint
+        shell: bash
+        run: |
+          set +e
+          docker run --rm -v "$PWD:/repo" -w /repo rhysd/actionlint:latest -color=false .github/workflows/build-offline-historical-railways-v2.yml > /tmp/actionlint.txt 2>&1
+          code=$?
+          set -e
+          mkdir -p generated/historical_railways_build
+          printf 'exit_code=%s\n' "$code" > generated/historical_railways_build/actionlint.txt
+          cat /tmp/actionlint.txt >> generated/historical_railways_build/actionlint.txt
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add generated/historical_railways_build/actionlint.txt
+          git commit -m 'Store railway workflow lint result [skip ci]' || true
+          git push origin main
