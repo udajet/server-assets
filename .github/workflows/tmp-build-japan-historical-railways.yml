@@ -1,15 +1,15 @@
 name: Temporary build Japan historical railways
 
 on:
-  issue_comment:
-    types: [created]
+  issues:
+    types: [opened]
 
 permissions:
   contents: write
 
 jobs:
   build:
-    if: github.event.issue.pull_request && github.event.comment.body == '/build-historical-railways'
+    if: github.event.issue.title == 'RUN_TEMP_HISTORICAL_RAILWAY_BUILD'
     runs-on: ubuntu-latest
     timeout-minutes: 180
     steps:
