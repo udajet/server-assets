@@ -1,0 +1,9 @@
+{
+  "exit_code": 1,
+  "run_id": 30699006597,
+  "artifact_name": "japan-historical-railways-offline-v3-30699006597",
+  "kmz_bytes": 0,
+  "sha256": "",
+  "completed_utc": "2026-08-01T12:10:29Z",
+  "builder": "pbf-v3"
+}
