@@ -7,7 +7,7 @@ on:
       - tools/mlit_encoding_probe_trigger.txt
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   probe:
@@ -24,73 +24,68 @@ jobs:
       - name: Inspect MLIT archive
         run: |
           python - <<'PY'
-          import base64, io, json, re, zipfile
+          import io, json, zipfile
           from pathlib import Path
           import chardet, requests
           from charset_normalizer import from_bytes
 
           url='https://nlftp.mlit.go.jp/ksj/gml/data/N05/N05-25/N05-25_GML.zip'
-          data=requests.get(url,timeout=300).content
-          z=zipfile.ZipFile(io.BytesIO(data))
-          names=z.namelist()
-          target=next(n for n in names if 'RailroadSection2' in n and n.lower().endswith(('.geojson','.json')))
+          archive=requests.get(url,timeout=300).content
+          z=zipfile.ZipFile(io.BytesIO(archive))
+          target=next(n for n in z.namelist() if 'RailroadSection2' in n and n.lower().endswith(('.geojson','.json')))
           raw=z.read(target)
+          best=from_bytes(raw[:5_000_000]).best()
           report={
-            'archive_bytes':len(data),
+            'archive_bytes':len(archive),
             'target':target,
             'target_bytes':len(raw),
-            'head_hex':raw[:512].hex(),
-            'chardet':chardet.detect(raw[:1000000]),
-            'charset_normalizer':str(from_bytes(raw[:1000000]).best()),
+            'head_hex':raw[:128].hex(),
+            'chardet':chardet.detect(raw[:5_000_000]),
+            'charset_normalizer': None if best is None else {
+              'encoding':best.encoding,
+              'percent_chaos':best.percent_chaos,
+              'percent_coherence':best.percent_coherence,
+            },
             'attempts':{},
           }
+
+          def compact_props(props):
+            result={}
+            for key,value in props.items():
+              if key.startswith('N05') or key in {'路線名','事業者名'}:
+                result[str(key)]=str(value)[:200]
+            return result
+
           for enc in ['utf-8-sig','utf-8','cp932','shift_jis','euc_jp','utf-16','utf-16le','utf-16be']:
             item={}
-            try:
-              text=raw.decode(enc)
-              item['strict_ok']=True
-              item['replacement_count']=text.count('\ufffd')
-              obj=json.loads(text)
-              item['json_ok']=True
-              feats=obj.get('features',[])
-              item['features']=len(feats)
-              samples=[]
-              for f in feats:
-                g=f.get('geometry') or {}; c=g.get('coordinates') or []
-                flat=[]
-                if g.get('type')=='LineString': flat=c
-                elif g.get('type')=='MultiLineString': flat=[p for part in c for p in part]
-                if any(138.45<=float(p[0])<=138.75 and 35.50<=float(p[1])<=35.80 for p in flat if len(p)>=2):
-                  samples.append(f.get('properties',{}))
-                  if len(samples)>=10: break
-              item['kofu_samples']=samples
-            except Exception as e:
-              item['strict_ok']=False
-              item['error']=repr(e)
+            for errors in ['strict','replace']:
+              label='strict' if errors=='strict' else 'fallback'
               try:
-                text=raw.decode(enc,errors='replace')
-                item['replacement_count_fallback']=text.count('\ufffd')
+                text=raw.decode(enc,errors=errors)
+                item[label+'_replacement_count']=text.count('\ufffd')
                 obj=json.loads(text)
-                item['fallback_json_ok']=True
                 feats=obj.get('features',[])
+                item[label+'_json_ok']=True
+                item[label+'_features']=len(feats)
                 samples=[]
-                for f in feats:
-                  g=f.get('geometry') or {}; c=g.get('coordinates') or []
-                  flat=[]
-                  if g.get('type')=='LineString': flat=c
-                  elif g.get('type')=='MultiLineString': flat=[p for part in c for p in part]
+                for feature in feats:
+                  geom=feature.get('geometry') or {}
+                  coords=geom.get('coordinates') or []
+                  flat=coords if geom.get('type')=='LineString' else [p for part in coords for p in part] if geom.get('type')=='MultiLineString' else []
                   if any(138.45<=float(p[0])<=138.75 and 35.50<=float(p[1])<=35.80 for p in flat if len(p)>=2):
-                    samples.append(f.get('properties',{}))
-                    if len(samples)>=5: break
-                item['fallback_kofu_samples']=samples
-              except Exception as e2:
-                item['fallback_error']=repr(e2)
+                    samples.append(compact_props(feature.get('properties') or {}))
+                    if len(samples)>=7:
+                      break
+                item[label+'_kofu_samples']=samples
+              except Exception as exc:
+                item[label+'_error']=type(exc).__name__+': '+str(exc)[:300]
             report['attempts'][enc]=item
-          Path('generated').mkdir(exist_ok=True)
-          Path('generated/mlit_encoding_probe.json').write_text(json.dumps(report,ensure_ascii=False,indent=2),encoding='utf-8')
+          output=json.dumps(report,ensure_ascii=False,indent=2)
+          print(output)
+          Path('/tmp/mlit_encoding_probe.json').write_text(output,encoding='utf-8')
           PY
-          git config user.name 'github-actions[bot]'
-          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add generated/mlit_encoding_probe.json
-          git commit -m 'Store MLIT encoding probe [skip ci]' || true
-          git push origin main
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mlit-encoding-probe-${{ github.run_id }}
+          path: /tmp/mlit_encoding_probe.json
+          retention-days: 3
