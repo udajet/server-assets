@@ -1,4 +1,4 @@
-name: Build offline Japan historical railways KMZ v4
+name: Build offline Japan historical railways KMZ v5
 
 on:
   pull_request:
@@ -34,7 +34,7 @@ jobs:
                   'state': 'running',
                   'run_id': int(os.environ['GITHUB_RUN_ID']),
                   'started_utc': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
-                  'builder': 'pbf-v4',
+                  'builder': 'pbf-v5',
               }, ensure_ascii=False, indent=2),
               encoding='utf-8',
           )
@@ -51,40 +51,45 @@ jobs:
           sudo apt-get install -y osmium-tool
           python -m pip install --upgrade requests pyshp
 
-      - name: Download base builder
+      - name: Download and patch base builder
         run: |
           curl -fsSL 'https://raw.githubusercontent.com/udajet/server-assets/tmp-build-japan-historical-railways-v4/tools/build_japan_historical_railways.py' -o /tmp/base_builder.py
+          sed -i 's#operator = p.get("N05_001") or p.get("事業者名") or p.get("operator")#operator = p.get("N05_003") or p.get("事業者名") or p.get("operator") or p.get("N05_001")#' /tmp/base_builder.py
+          grep -F 'operator = p.get("N05_003")' /tmp/base_builder.py
 
-      - name: Normalize OpenHistoricalMap S3 URL
+      - name: Patch source decoders and OpenHistoricalMap URL
         run: |
+          sed -i 's#for enc in ("utf-8-sig", "cp932", "shift_jis"):#for enc in ("cp932", "shift_jis", "utf-8-sig"):#' tools/run_pbf_offline_builder.py
+          sed -i 's#return json.loads(raw.decode(enc))#return json.loads(raw.decode(enc, errors="replace"))#' tools/run_pbf_offline_builder.py
           sed -i 's#return state.replace("http://", "https://")#return state.replace("http://", "https://").replace("https://planet.openhistoricalmap.org.s3.amazonaws.com/", "https://s3.amazonaws.com/planet.openhistoricalmap.org/")#' tools/run_pbf_offline_builder.py
+          grep -F 'for enc in ("cp932", "shift_jis", "utf-8-sig")' tools/run_pbf_offline_builder.py
           grep -F 's3.amazonaws.com/planet.openhistoricalmap.org/' tools/run_pbf_offline_builder.py
 
       - name: Build embedded offline KMZ
         id: build
         run: |
           set +e
-          BASE_BUILDER=/tmp/base_builder.py python tools/run_pbf_offline_builder.py > /tmp/build-v4.log 2>&1
+          BASE_BUILDER=/tmp/base_builder.py python tools/run_pbf_offline_builder.py > /tmp/build-v5.log 2>&1
           code=$?
           set -e
-          echo "$code" > /tmp/build-v4-exit
-          tail -n 250 /tmp/build-v4.log || true
+          echo "$code" > /tmp/build-v5-exit
+          tail -n 250 /tmp/build-v5.log || true
 
       - name: Prepare artifact
         if: always()
         run: |
-          mkdir -p /tmp/rail-v4-artifact
-          cp /tmp/build-v4.log /tmp/rail-v4-artifact/build.log 2>/dev/null || true
-          cp /tmp/build-v4-exit /tmp/rail-v4-artifact/build_exit_code.txt 2>/dev/null || true
-          cp out_historical_railways/Japan_Historical_Railways_Offline_MaxCoverage.kmz /tmp/rail-v4-artifact/ 2>/dev/null || true
-          cp out_historical_railways/coverage_report.json /tmp/rail-v4-artifact/ 2>/dev/null || true
+          mkdir -p /tmp/rail-v5-artifact
+          cp /tmp/build-v5.log /tmp/rail-v5-artifact/build.log 2>/dev/null || true
+          cp /tmp/build-v5-exit /tmp/rail-v5-artifact/build_exit_code.txt 2>/dev/null || true
+          cp out_historical_railways/Japan_Historical_Railways_Offline_MaxCoverage.kmz /tmp/rail-v5-artifact/ 2>/dev/null || true
+          cp out_historical_railways/coverage_report.json /tmp/rail-v5-artifact/ 2>/dev/null || true
 
       - name: Upload artifact
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: japan-historical-railways-offline-v4-${{ github.run_id }}
-          path: /tmp/rail-v4-artifact
+          name: japan-historical-railways-offline-v5-${{ github.run_id }}
+          path: /tmp/rail-v5-artifact
           if-no-files-found: error
           compression-level: 0
           retention-days: 14
@@ -93,9 +98,9 @@ jobs:
         if: always()
         run: |
           mkdir -p generated/historical_railways_build
-          cp /tmp/build-v4.log generated/historical_railways_build/build.log 2>/dev/null || true
+          cp /tmp/build-v5.log generated/historical_railways_build/build.log 2>/dev/null || true
           cp out_historical_railways/coverage_report.json generated/historical_railways_build/coverage_report.json 2>/dev/null || true
-          code=$(cat /tmp/build-v4-exit 2>/dev/null || echo 99)
+          code=$(cat /tmp/build-v5-exit 2>/dev/null || echo 99)
           file='out_historical_railways/Japan_Historical_Railways_Offline_MaxCoverage.kmz'
           size=0
           sha=''
@@ -110,11 +115,11 @@ jobs:
               json.dumps({
                   'exit_code': int(os.environ['CODE']),
                   'run_id': int(os.environ['GITHUB_RUN_ID']),
-                  'artifact_name': 'japan-historical-railways-offline-v4-' + os.environ['GITHUB_RUN_ID'],
+                  'artifact_name': 'japan-historical-railways-offline-v5-' + os.environ['GITHUB_RUN_ID'],
                   'kmz_bytes': int(os.environ['SIZE']),
                   'sha256': os.environ['SHA'],
                   'completed_utc': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
-                  'builder': 'pbf-v4',
+                  'builder': 'pbf-v5',
               }, ensure_ascii=False, indent=2),
               encoding='utf-8',
           )
