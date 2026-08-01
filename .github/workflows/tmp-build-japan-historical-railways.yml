@@ -5,6 +5,10 @@ on:
     branches: [main]
     paths:
       - .github/workflows/tmp-build-japan-historical-railways.yml
+  pull_request:
+    branches: [main]
+    paths:
+      - tools/historical_railway_build_request.txt
 
 permissions:
   contents: write
