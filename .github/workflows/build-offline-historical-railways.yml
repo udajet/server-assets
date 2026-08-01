@@ -1,6 +1,10 @@
 name: Build offline Japan historical railways KMZ
 
 on:
+  push:
+    branches: [main]
+    paths:
+      - tools/offline_historical_railway_build_trigger.txt
   schedule:
     - cron: '*/5 * * * *'
   workflow_dispatch:
