@@ -1,0 +1,58 @@
+name: Build Japan historical railways KMZ v5
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install dependencies
+        run: python -m pip install --upgrade requests pyshp
+      - name: Patch MLIT text encoding detection
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          p = Path('tools/build_japan_historical_railways.py')
+          s = p.read_text(encoding='utf-8')
+          old = '''    if path.suffix.lower() in {".json", ".geojson"}:
+        with path.open(encoding="utf-8") as f:
+            obj = json.load(f)
+        return obj.get("features", [])'''
+          new = '''    if path.suffix.lower() in {".json", ".geojson"}:
+        raw = path.read_bytes()
+        text = None
+        for enc in ("utf-8-sig", "cp932", "shift_jis"):
+            try:
+                text = raw.decode(enc)
+                break
+            except UnicodeDecodeError:
+                pass
+        if text is None:
+            text = raw.decode("utf-8", errors="replace")
+        obj = json.loads(text)
+        return obj.get("features", [])'''
+          if old not in s:
+              raise SystemExit('encoding patch target not found')
+          p.write_text(s.replace(old, new), encoding='utf-8')
+          PY
+      - name: Build maximum-coverage KMZ
+        run: python tools/build_japan_historical_railways.py
+      - name: Upload result
+        uses: actions/upload-artifact@v4
+        with:
+          name: japan-historical-railways-kmz-v5
+          path: |
+            out_historical_railways/Japan_PublicData_Maximum_Historical_Railways.kmz
+            out_historical_railways/coverage_report.json
+          if-no-files-found: error
+          compression-level: 0
