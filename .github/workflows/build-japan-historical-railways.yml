@@ -21,6 +21,33 @@ jobs:
           python-version: '3.12'
       - name: Install dependencies
         run: python -m pip install --upgrade requests pyshp
+      - name: Patch MLIT text encoding detection
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          p = Path('tools/build_japan_historical_railways.py')
+          s = p.read_text(encoding='utf-8')
+          old = '''    if path.suffix.lower() in {".json", ".geojson"}:
+        with path.open(encoding="utf-8") as f:
+            obj = json.load(f)
+        return obj.get("features", [])'''
+          new = '''    if path.suffix.lower() in {".json", ".geojson"}:
+        raw = path.read_bytes()
+        text = None
+        for enc in ("utf-8-sig", "cp932", "shift_jis"):
+            try:
+                text = raw.decode(enc)
+                break
+            except UnicodeDecodeError:
+                pass
+        if text is None:
+            text = raw.decode("utf-8", errors="replace")
+        obj = json.loads(text)
+        return obj.get("features", [])'''
+          if old not in s:
+              raise SystemExit('encoding patch target not found')
+          p.write_text(s.replace(old, new), encoding='utf-8')
+          PY
       - name: Build maximum-coverage KMZ
         run: python tools/build_japan_historical_railways.py
       - name: Upload result
