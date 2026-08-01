@@ -4,7 +4,7 @@ on:
   pull_request:
     branches: [main]
     paths:
-      - tools/build_japan_historical_railways.py
+      - 'tools/**'
       - .github/workflows/build-japan-historical-railways.yml
 
 permissions:
