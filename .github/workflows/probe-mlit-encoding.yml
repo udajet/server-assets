@@ -20,72 +20,48 @@ jobs:
         with:
           python-version: '3.12'
       - name: Install diagnostics
-        run: python -m pip install requests charset-normalizer chardet
-      - name: Inspect MLIT archive
+        run: python -m pip install requests
+      - name: Test CP932 JSON repair
         run: |
           python - <<'PY'
-          import io, json, zipfile
+          import io, json, re, zipfile
           from pathlib import Path
-          import chardet, requests
-          from charset_normalizer import from_bytes
+          import requests
 
           url='https://nlftp.mlit.go.jp/ksj/gml/data/N05/N05-25/N05-25_GML.zip'
           archive=requests.get(url,timeout=300).content
           z=zipfile.ZipFile(io.BytesIO(archive))
           target=next(n for n in z.namelist() if 'RailroadSection2' in n and n.lower().endswith(('.geojson','.json')))
           raw=z.read(target)
-          best=from_bytes(raw[:5_000_000]).best()
+          text=raw.decode('cp932')
+          invalid=list(re.finditer(r'\\(?!["\\/bfnrtu])',text))
+          repaired=re.sub(r'\\(?!["\\/bfnrtu])',r'\\\\',text)
+          obj=json.loads(repaired)
+          feats=obj.get('features',[])
+          samples=[]
+          for feature in feats:
+            geom=feature.get('geometry') or {}
+            coords=geom.get('coordinates') or []
+            flat=coords if geom.get('type')=='LineString' else [p for part in coords for p in part] if geom.get('type')=='MultiLineString' else []
+            if any(138.45<=float(p[0])<=138.75 and 35.50<=float(p[1])<=35.80 for p in flat if len(p)>=2):
+              props=feature.get('properties') or {}
+              samples.append({k:str(v)[:200] for k,v in props.items() if k.startswith('N05')})
+              if len(samples)>=10:
+                break
           report={
-            'archive_bytes':len(archive),
             'target':target,
-            'target_bytes':len(raw),
-            'head_hex':raw[:128].hex(),
-            'chardet':chardet.detect(raw[:5_000_000]),
-            'charset_normalizer': None if best is None else {
-              'encoding':best.encoding,
-              'percent_chaos':best.percent_chaos,
-              'percent_coherence':best.percent_coherence,
-            },
-            'attempts':{},
+            'features':len(feats),
+            'invalid_backslashes':len(invalid),
+            'first_invalid_contexts':[text[max(0,m.start()-50):m.start()+80] for m in invalid[:10]],
+            'replacement_characters':repaired.count('\ufffd'),
+            'kofu_samples':samples,
           }
-
-          def compact_props(props):
-            result={}
-            for key,value in props.items():
-              if key.startswith('N05') or key in {'路線名','事業者名'}:
-                result[str(key)]=str(value)[:200]
-            return result
-
-          for enc in ['utf-8-sig','utf-8','cp932','shift_jis','euc_jp','utf-16','utf-16le','utf-16be']:
-            item={}
-            for errors in ['strict','replace']:
-              label='strict' if errors=='strict' else 'fallback'
-              try:
-                text=raw.decode(enc,errors=errors)
-                item[label+'_replacement_count']=text.count('\ufffd')
-                obj=json.loads(text)
-                feats=obj.get('features',[])
-                item[label+'_json_ok']=True
-                item[label+'_features']=len(feats)
-                samples=[]
-                for feature in feats:
-                  geom=feature.get('geometry') or {}
-                  coords=geom.get('coordinates') or []
-                  flat=coords if geom.get('type')=='LineString' else [p for part in coords for p in part] if geom.get('type')=='MultiLineString' else []
-                  if any(138.45<=float(p[0])<=138.75 and 35.50<=float(p[1])<=35.80 for p in flat if len(p)>=2):
-                    samples.append(compact_props(feature.get('properties') or {}))
-                    if len(samples)>=7:
-                      break
-                item[label+'_kofu_samples']=samples
-              except Exception as exc:
-                item[label+'_error']=type(exc).__name__+': '+str(exc)[:300]
-            report['attempts'][enc]=item
           output=json.dumps(report,ensure_ascii=False,indent=2)
           print(output)
-          Path('/tmp/mlit_encoding_probe.json').write_text(output,encoding='utf-8')
+          Path('/tmp/mlit_cp932_repair_probe.json').write_text(output,encoding='utf-8')
           PY
       - uses: actions/upload-artifact@v4
         with:
-          name: mlit-encoding-probe-${{ github.run_id }}
-          path: /tmp/mlit_encoding_probe.json
+          name: mlit-cp932-repair-probe-${{ github.run_id }}
+          path: /tmp/mlit_cp932_repair_probe.json
           retention-days: 3
