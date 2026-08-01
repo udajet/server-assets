@@ -57,19 +57,8 @@ jobs:
 
       - name: Normalize OpenHistoricalMap S3 URL
         run: |
-          python - <<'PY'
-          from pathlib import Path
-          path = Path('tools/run_pbf_offline_builder.py')
-          text = path.read_text(encoding='utf-8')
-          old = 'return state.replace("http://", "https://")'
-          new = '''return state.replace("http://", "https://").replace(
-            "https://planet.openhistoricalmap.org.s3.amazonaws.com/",
-            "https://s3.amazonaws.com/planet.openhistoricalmap.org/",
-        )'''
-          if old not in text:
-              raise SystemExit('OHM URL normalization target not found')
-          path.write_text(text.replace(old, new), encoding='utf-8')
-          PY
+          sed -i 's#return state.replace("http://", "https://")#return state.replace("http://", "https://").replace("https://planet.openhistoricalmap.org.s3.amazonaws.com/", "https://s3.amazonaws.com/planet.openhistoricalmap.org/")#' tools/run_pbf_offline_builder.py
+          grep -F 's3.amazonaws.com/planet.openhistoricalmap.org/' tools/run_pbf_offline_builder.py
 
       - name: Build embedded offline KMZ
         id: build
