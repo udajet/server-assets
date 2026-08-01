@@ -1,0 +1,316 @@
+name: Build offline Japan historical railways KMZ v2
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - tools/offline_historical_railway_build_trigger_v2.txt
+  pull_request:
+    branches: [main]
+    paths:
+      - tools/offline_historical_railway_build_trigger_v2.txt
+  schedule:
+    - cron: '7,17,27,37,47,57 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: offline-japan-historical-railways
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Publish running marker
+        shell: bash
+        run: |
+          mkdir -p generated/historical_railways_build
+          python - <<PY
+          import json,time
+          from pathlib import Path
+          Path('generated/historical_railways_build/running.json').write_text(json.dumps({
+            'state':'running','run_id':int('${GITHUB_RUN_ID}'),
+            'started_utc':time.strftime('%Y-%m-%dT%H:%M:%SZ',time.gmtime()),
+            'builder':'pbf-v2'
+          },ensure_ascii=False,indent=2),encoding='utf-8')
+          PY
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add generated/historical_railways_build/running.json
+          git commit -m 'Mark offline railway build running [skip ci]' || true
+          git push origin main || true
+
+      - name: Install processing tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y osmium-tool
+          python -m pip install --upgrade requests pyshp
+
+      - name: Download base builder
+        run: |
+          curl -fsSL 'https://raw.githubusercontent.com/udajet/server-assets/tmp-build-japan-historical-railways-v4/tools/build_japan_historical_railways.py' -o /tmp/base_builder.py
+          python - <<'PY'
+          from pathlib import Path
+          p=Path('/tmp/base_builder.py')
+          s=p.read_text(encoding='utf-8')
+          old='''    if path.suffix.lower() in {".json", ".geojson"}:
+        with path.open(encoding="utf-8") as f:
+            obj = json.load(f)
+        return obj.get("features", [])'''
+          new='''    if path.suffix.lower() in {".json", ".geojson"}:
+        raw = path.read_bytes()
+        text = None
+        for enc in ("utf-8-sig", "cp932", "shift_jis"):
+            try:
+                text = raw.decode(enc)
+                break
+            except UnicodeDecodeError:
+                pass
+        if text is None:
+            text = raw.decode("utf-8", errors="replace")
+        obj = json.loads(text)
+        return obj.get("features", [])'''
+          if old not in s:
+              raise SystemExit('encoding patch target missing')
+          s=s.replace(old,new)
+          s=s.replace('operator = p.get("N05_001") or p.get("事業者名") or p.get("operator")',
+                      'operator = p.get("N05_003") or p.get("事業者名") or p.get("operator") or p.get("N05_001")')
+          s=s.replace('<IconStyle><scale>0.55</scale><Icon><href>http://maps.google.com/mapfiles/kml/shapes/rail.png</href></Icon></IconStyle>',
+                      '<IconStyle><scale>0.55</scale></IconStyle>')
+          s=s.replace('Japan_PublicData_Maximum_Historical_Railways.kmz',
+                      'Japan_Historical_Railways_Offline_MaxCoverage.kmz')
+          p.write_text(s,encoding='utf-8')
+          PY
+
+      - name: Write PBF integration wrapper
+        shell: bash
+        run: |
+          cat > /tmp/run_pbf_builder.py <<'PY'
+          from __future__ import annotations
+          import hashlib, html, importlib.util, json, os, re, shutil, subprocess, time, zipfile
+          from collections import defaultdict
+          from pathlib import Path
+          from xml.etree import ElementTree as ET
+          import requests
+
+          spec=importlib.util.spec_from_file_location('base_builder','/tmp/base_builder.py')
+          b=importlib.util.module_from_spec(spec)
+          assert spec.loader
+          spec.loader.exec_module(b)
+
+          GEOFABRIK={
+            '北海道':'https://download.geofabrik.de/asia/japan/hokkaido-latest.osm.pbf',
+            '東北':'https://download.geofabrik.de/asia/japan/tohoku-latest.osm.pbf',
+            '関東':'https://download.geofabrik.de/asia/japan/kanto-latest.osm.pbf',
+            '中部':'https://download.geofabrik.de/asia/japan/chubu-latest.osm.pbf',
+            '関西':'https://download.geofabrik.de/asia/japan/kansai-latest.osm.pbf',
+            '中国':'https://download.geofabrik.de/asia/japan/chugoku-latest.osm.pbf',
+            '四国':'https://download.geofabrik.de/asia/japan/shikoku-latest.osm.pbf',
+            '九州':'https://download.geofabrik.de/asia/japan/kyushu-latest.osm.pbf',
+          }
+          OHM_STATE='https://s3.amazonaws.com/planet.openhistoricalmap.org/planet/state.txt'
+          OHM_BUCKET='https://s3.amazonaws.com/planet.openhistoricalmap.org'
+          LINE_VALUES={'rail','tram','light_rail','subway','narrow_gauge','monorail','funicular','preserved','miniature','abandoned','disused','razed','dismantled','demolished','removed','historic'}
+          HIST_VALUES={'abandoned','disused','razed','dismantled','demolished','removed','historic'}
+          LIFE=['abandoned:railway','disused:railway','demolished:railway','razed:railway','dismantled:railway','removed:railway','former:railway','was:railway']
+          S=requests.Session(); S.headers.update({'User-Agent':b.UA})
+
+          def run(cmd):
+            b.log('RUN '+' '.join(map(str,cmd)))
+            subprocess.run(list(map(str,cmd)),check=True)
+
+          def download(url,dest,min_bytes=100):
+            dest=Path(dest); dest.parent.mkdir(parents=True,exist_ok=True)
+            if dest.exists() and dest.stat().st_size>=min_bytes: return dest
+            tmp=dest.with_suffix(dest.suffix+'.part')
+            for a in range(5):
+              try:
+                b.log('DOWNLOAD '+url)
+                with S.get(url,stream=True,timeout=(30,3600),allow_redirects=True) as r:
+                  r.raise_for_status()
+                  with tmp.open('wb') as f:
+                    for chunk in r.iter_content(1024*1024):
+                      if chunk: f.write(chunk)
+                if tmp.stat().st_size<min_bytes: raise RuntimeError('download too small')
+                tmp.replace(dest); return dest
+              except Exception as e:
+                b.log(f'download retry {a+1}: {e}'); tmp.unlink(missing_ok=True)
+                if a==4: raise
+                time.sleep(5*(a+1))
+
+          def filter_export(inp,stem):
+            stem=Path(stem); filtered=stem.with_suffix('.filtered.pbf'); seq=stem.with_suffix('.geojsonseq')
+            filters=['w/railway']+[f'w/{k}' for k in LIFE]
+            run(['osmium','tags-filter',inp,*filters,'-o',filtered,'--overwrite'])
+            run(['osmium','export',filtered,'-f','geojsonseq','-o',seq,'--overwrite'])
+            return filtered,seq
+
+          def process_seq(seq,source,region_hint=''):
+            out=[]; seen=set()
+            with Path(seq).open(encoding='utf-8',errors='replace') as f:
+              for raw in f:
+                raw=raw.strip('\x1e\r\n ')
+                if not raw: continue
+                try: feat=json.loads(raw)
+                except Exception: continue
+                p=feat.get('properties') or {}; railway=str(p.get('railway') or '')
+                lifecycle=next((k for k in LIFE if p.get(k) not in (None,'')), '')
+                if railway not in LINE_VALUES and not lifecycle: continue
+                historical=railway in HIST_VALUES or bool(lifecycle) or bool(p.get('end_date'))
+                status='歴史・廃止等' if historical else '現存・状態不明'
+                ident=str(p.get('@id') or p.get('id') or '')
+                name=p.get('name:ja') or p.get('name') or p.get('old_name') or ident or '名称不明'
+                rows=[f'出典: {html.escape(source)}',f'ID: {html.escape(ident)}']
+                for k in ['railway','name','name:ja','old_name','operator','usage','service','start_date','end_date',*LIFE]:
+                  if p.get(k) not in (None,''): rows.append(f'{html.escape(k)}: {html.escape(str(p[k]))}')
+                for coords in b.iter_geojson_lines(feat.get('geometry')):
+                  key=hashlib.blake2b((';'.join(f'{x:.6f},{y:.6f}' for x,y in coords)).encode(),digest_size=16).digest()
+                  if key in seen: continue
+                  seen.add(key)
+                  x=b.feature(str(name),coords,'<br>'.join(rows),status,source,p)
+                  if region_hint: x['region']=region_hint
+                  out.append(x)
+            return out
+
+          def load_osm():
+            all_features=[]; details={}; root=b.WORK/'pbf_osm'; root.mkdir(exist_ok=True)
+            for region,url in GEOFABRIK.items():
+              inp=download(url,root/f'{region}.osm.pbf',100000)
+              filtered,seq=filter_export(inp,root/f'{region}.railways')
+              feats=process_seq(seq,'OpenStreetMap',region)
+              all_features.extend(feats)
+              details[region]={'url':url,'ways':len(feats),'bytes':inp.stat().st_size}
+              for p in (inp,filtered,seq): Path(p).unlink(missing_ok=True)
+              b.log(f'OSM {region}: {len(feats)} lines; total {len(all_features)}')
+            b.REPORT['sources']['OpenStreetMap']={'ways':len(all_features),'regions':details,'license':'ODbL 1.0'}
+            return all_features
+
+          def ohm_url():
+            state=S.get(OHM_STATE,timeout=90).text.strip()
+            if state.endswith('.osm.pbf') and 'full-history' not in state:
+              return state.replace('http://','https://')
+            xml=S.get(OHM_BUCKET+'?prefix=planet/',timeout=180).text
+            keys=re.findall(r'<Key>(planet/planet-[^<]+?\.osm\.pbf)</Key>',xml)
+            keys=[k for k in keys if 'full-history' not in k]
+            if not keys: raise RuntimeError('OHM planet URL not found')
+            return OHM_BUCKET+'/'+sorted(keys)[-1]
+
+          def load_ohm():
+            root=b.WORK/'pbf_ohm'; root.mkdir(exist_ok=True)
+            url=ohm_url(); planet=download(url,root/'planet.osm.pbf',1000000)
+            japan=root/'japan.osm.pbf'
+            run(['osmium','extract','-b','121.0,23.0,155.5,47.7',planet,'-o',japan,'--overwrite','--strategy=smart'])
+            filtered,seq=filter_export(japan,root/'japan.railways')
+            feats=process_seq(seq,'OpenHistoricalMap')
+            b.REPORT['sources']['OpenHistoricalMap']={'ways':len(feats),'planet_url':url,'planet_bytes':planet.stat().st_size,'license':'CC0 except where noted'}
+            for p in (planet,japan,filtered,seq): Path(p).unlink(missing_ok=True)
+            b.log(f'OHM: {len(feats)} lines')
+            return feats
+
+          def naebo(layer_root):
+            links=[]; total=0
+            for label,url in b.NAEBO.items():
+              dest=layer_root/'naeboworks'/(label.replace('・','_')+'.kml')
+              try:
+                download(url,dest,100)
+                text=dest.read_text(encoding='utf-8',errors='replace')
+                text=re.sub(r'<(?:(?:\w+):)?href>\s*https?://.*?</(?:(?:\w+):)?href>','<href></href>',text,flags=re.I|re.S)
+                dest.write_text(text,encoding='utf-8')
+                ET.fromstring(text.encode())
+                n=len(re.findall(r'<(?:\w+:)?LineString\b',text,re.I)); total+=n
+                links.append((f'苗穂工房・{label}',str(dest.relative_to(layer_root.parent)).replace(os.sep,'/'),n))
+              except Exception as e: b.log(f'Naebo {label} failed: {e}')
+            b.REPORT['sources']['NaeboWorks']={'downloaded_regions':len(links),'embedded_lines_reported':total,'license':'CC BY 4.0'}
+            return links
+
+          b.download_naebo=naebo
+          mlit,stations=b.load_mlit(); b.log(f'MLIT {len(mlit)} lines')
+          osm=load_osm(); ohm=load_ohm()
+          out=b.build_kmz(mlit,stations,osm,ohm)
+          target=b.OUT/'Japan_Historical_Railways_Offline_MaxCoverage.kmz'
+          if out!=target: out.replace(target)
+
+          external=[]; errors=[]; lines=points=kmls=0
+          with zipfile.ZipFile(target) as z:
+            for name in z.namelist():
+              if not name.lower().endswith('.kml'): continue
+              kmls+=1; data=z.read(name)
+              try: ET.fromstring(data)
+              except Exception as e: errors.append(f'{name}: {e}')
+              lines+=len(re.findall(br'<(?:\w+:)?LineString\b',data,re.I))
+              points+=len(re.findall(br'<(?:\w+:)?Point\b',data,re.I))
+              for h in re.findall(br'<(?:\w+:)?href>(.*?)</(?:\w+:)?href>',data,re.I|re.S):
+                href=h.decode('utf-8','replace').strip()
+                if re.match(r'(?i)https?://',href): external.append({'file':name,'href':href})
+          audit={'kmz_bytes':target.stat().st_size,'sha256':hashlib.sha256(target.read_bytes()).hexdigest(),'kml_files':kmls,'LineString':lines,'Point':points,'xml_errors':errors,'external_hrefs':external}
+          b.REPORT['offline_audit']=audit
+          (b.OUT/'coverage_report.json').write_text(json.dumps(b.REPORT,ensure_ascii=False,indent=2),encoding='utf-8')
+          if not mlit or not osm or not ohm or lines<=0 or errors or external:
+            raise RuntimeError('offline audit failed: '+json.dumps(audit,ensure_ascii=False))
+          print(json.dumps(audit,ensure_ascii=False,indent=2),flush=True)
+          PY
+
+      - name: Build embedded offline KMZ
+        id: build
+        shell: bash
+        run: |
+          set +e
+          python /tmp/run_pbf_builder.py > /tmp/build-v2.log 2>&1
+          code=$?
+          set -e
+          echo "$code" > /tmp/build-v2-exit
+          tail -n 250 /tmp/build-v2.log || true
+
+      - name: Prepare artifact
+        if: always()
+        run: |
+          mkdir -p /tmp/rail-v2-artifact
+          cp /tmp/build-v2.log /tmp/rail-v2-artifact/build.log 2>/dev/null || true
+          cp /tmp/build-v2-exit /tmp/rail-v2-artifact/build_exit_code.txt 2>/dev/null || true
+          cp out_historical_railways/Japan_Historical_Railways_Offline_MaxCoverage.kmz /tmp/rail-v2-artifact/ 2>/dev/null || true
+          cp out_historical_railways/coverage_report.json /tmp/rail-v2-artifact/ 2>/dev/null || true
+
+      - name: Upload artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: japan-historical-railways-offline-v2-${{ github.run_id }}
+          path: /tmp/rail-v2-artifact
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
+
+      - name: Publish final status
+        if: always()
+        shell: bash
+        run: |
+          mkdir -p generated/historical_railways_build
+          cp /tmp/build-v2.log generated/historical_railways_build/build.log 2>/dev/null || true
+          cp out_historical_railways/coverage_report.json generated/historical_railways_build/coverage_report.json 2>/dev/null || true
+          code=$(cat /tmp/build-v2-exit 2>/dev/null || echo 99)
+          file='out_historical_railways/Japan_Historical_Railways_Offline_MaxCoverage.kmz'
+          size=0; sha=''
+          if [ -f "$file" ]; then size=$(stat -c%s "$file"); sha=$(sha256sum "$file"|awk '{print $1}'); fi
+          python - <<PY
+          import json,time
+          from pathlib import Path
+          Path('generated/historical_railways_build/status.json').write_text(json.dumps({
+            'exit_code':int('$code'),'run_id':int('${GITHUB_RUN_ID}'),
+            'artifact_name':'japan-historical-railways-offline-v2-${GITHUB_RUN_ID}',
+            'kmz_bytes':int('$size'),'sha256':'$sha',
+            'completed_utc':time.strftime('%Y-%m-%dT%H:%M:%SZ',time.gmtime()),
+            'builder':'pbf-v2'
+          },ensure_ascii=False,indent=2),encoding='utf-8')
+          PY
+          git pull --rebase origin main || true
+          git add generated/historical_railways_build
+          git commit -m 'Store offline railway build result [skip ci]' || true
+          git push origin main || true
